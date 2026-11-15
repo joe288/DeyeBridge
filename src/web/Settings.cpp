@@ -49,6 +49,10 @@ namespace DeyeBridge
         clientId.toCharArray(mSettings.mqttClientId, sizeof(mSettings.mqttClientId));
         const String base = mPrefs.getString("mqtt_base", "deye");
         base.toCharArray(mSettings.mqttBaseTopic, sizeof(mSettings.mqttBaseTopic));
+        const String victronMac = mPrefs.getString("victron_mac", "");
+        victronMac.toCharArray(mSettings.victronMac, sizeof(mSettings.victronMac));
+        const String victronKey = mPrefs.getString("victron_key", "");
+        victronKey.toCharArray(mSettings.victronKey, sizeof(mSettings.victronKey));
 
         mSettings.pollIntervalMs = mPrefs.getULong("poll_ms", 2000);
         mSettings.publishIntervalMs = mPrefs.getULong("pub_ms", 5000);
@@ -77,6 +81,8 @@ namespace DeyeBridge
         mPrefs.putString("mqtt_pass", mSettings.mqttPassword);
         mPrefs.putString("mqtt_client", mSettings.mqttClientId);
         mPrefs.putString("mqtt_base", mSettings.mqttBaseTopic);
+        mPrefs.putString("victron_mac", mSettings.victronMac);
+        mPrefs.putString("victron_key", mSettings.victronKey);
         mPrefs.putULong("poll_ms", mSettings.pollIntervalMs);
         mPrefs.putULong("pub_ms", mSettings.publishIntervalMs);
         mPrefs.putUChar("slave_id", mSettings.slaveId);

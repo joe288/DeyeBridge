@@ -12,7 +12,28 @@ eingetragen wurde, erscheinen alle Entities automatisch (MQTT Discovery).
 | JSON-Gesamtstatus | `<base>/state` |
 | Verfügbarkeit (LWT) | `<base>/status` (`online`/`offline`, retained) |
 | Steuerung | `<base>/set/<key>` (z. B. `deye/set/max_sell_power`) |
+| Victron BLE Solar Charger | `<base>/victron/<mac>` (JSON, MAC ohne Trennzeichen) |
 | HA-Discovery | `homeassistant/<typ>/deye-bridge/<key>/config` (retained) |
+| Victron HA-Discovery | `homeassistant/sensor/deye-bridge-victron/<mac>_<key>/config` (retained) |
+
+## Victron Solar Charger per BLE
+
+Optional kann ein Victron-Solar-Laderegler über BLE eingebunden werden. Dazu
+MAC-Adresse und 32-stelligen BLE-Schlüssel im Web-Setup eintragen und speichern.
+Nach dem Neustart veröffentlicht DeyeBridge die Messwerte als JSON unter
+`<base>/victron/<mac>` und legt ein eigenes Victron-Gerät mit diesen HA-Sensoren
+an: Batteriespannung, Batteriestrom, PV-Leistung, Tagesertrag, kumulierter
+Gesamtenergiezähler und Ladestatus.
+Für die Diagnose ohne seriellen Zugriff zeigt `/diag` `victron_configured`
+(Konfiguration gültig) und `victron_data_received` (BLE-Daten empfangen) an.
+Zusätzlich wird `yield_total` als kumulierter Energiezähler (`kWh`,
+`total_increasing`) veröffentlicht und in NVS gespeichert. Da Victron BLE nur
+den Tagesertrag liefert, startet der Zähler bei der ersten Aktivierung mit dem
+aktuellen Tagesertrag; ein historischer Lebenszeitwert ist nicht verfügbar.
+
+Der eigene Topic-Zweig und das Discovery-Präfix `deye-bridge-victron` halten
+die Victron-Entities getrennt von den Deye-Inverter-Entities. Ohne vollständige
+MAC-Adresse und Schlüssel bleibt die BLE-Erfassung deaktiviert.
 
 ## Sensor-Entities
 

@@ -18,6 +18,8 @@ namespace DeyeBridge
         char mqttPassword[65] = "";
         char mqttClientId[33] = "deye-bridge";
         char mqttBaseTopic[33] = "deye";
+        char victronMac[18] = "";
+        char victronKey[33] = "";
         uint32_t pollIntervalMs = 2000;
         uint32_t publishIntervalMs = 5000;
         uint8_t slaveId = 1;

@@ -5,6 +5,58 @@
 
 namespace DeyeBridge
 {
+    static constexpr uint32_t VictronEnergyMagic = 0x56434531;
+    static constexpr uint32_t VictronEnergySaveIntervalMs = 60000;
+
+    MqttClient *MqttClient::sVictronCallbackClient = nullptr;
+
+    static bool IsHexDigit(char c)
+    {
+        return (c >= '0' && c <= '9') ||
+               (c >= 'a' && c <= 'f') ||
+               (c >= 'A' && c <= 'F');
+    }
+
+    static bool NormalizeVictronMac(const char *input, char *output, size_t size)
+    {
+        size_t length = 0;
+        for (const char *p = input; *p; ++p)
+        {
+            if (*p == ':' || *p == '-')
+            {
+                continue;
+            }
+            if (!IsHexDigit(*p) || length >= 12)
+            {
+                return false;
+            }
+            output[length++] = (*p >= 'A' && *p <= 'F') ? static_cast<char>(*p + ('a' - 'A')) : *p;
+        }
+        if (length != 12 || size <= length)
+        {
+            output[0] = '\0';
+            return false;
+        }
+        output[length] = '\0';
+        return true;
+    }
+
+    static bool IsValidVictronKey(const char *key)
+    {
+        if (strlen(key) != 32)
+        {
+            return false;
+        }
+        for (size_t i = 0; i < 32; ++i)
+        {
+            if (!IsHexDigit(key[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void MqttClient::Init(WiFiClient &wifi, RegisterCache *cache, WriteQueue *queue,
                           const Settings &settings)
     {
@@ -14,6 +66,60 @@ namespace DeyeBridge
         mSettings = &settings;
 
         snprintf(mBase, sizeof(mBase), "%s/", settings.mqttBaseTopic);
+        sVictronCallbackClient = this;
+        if (settings.victronMac[0] || settings.victronKey[0])
+        {
+            if (!NormalizeVictronMac(settings.victronMac, mVictronMac, sizeof(mVictronMac)) ||
+                !IsValidVictronKey(settings.victronKey))
+            {
+                Log::warn("Victron: configure a valid 12-digit MAC and 32-digit hex key to enable BLE");
+            }
+            else
+            {
+                mVictron.setCallback(VictronDataCallback);
+                if (!mVictron.begin(5))
+                {
+                    Log::error("Victron: BLE initialization failed");
+                }
+                else if (!mVictron.addDevice("Victron Solar Charger", settings.victronMac,
+                                             settings.victronKey, DEVICE_TYPE_SOLAR_CHARGER))
+                {
+                    Log::error("Victron: failed to add configured solar charger");
+                }
+                else
+                {
+                    mVictronConfigured = true;
+                    if (!mVictronPreferences.begin("victron", false))
+                    {
+                        Log::error("Victron: failed to open energy counter storage");
+                    }
+                    else
+                    {
+                        mVictronPreferencesReady = true;
+                        const size_t storedSize = mVictronPreferences.getBytesLength("energy");
+                        if (storedSize == sizeof(VictronEnergyState))
+                        {
+                            VictronEnergyState stored = {};
+                            if (mVictronPreferences.getBytes("energy", &stored, sizeof(stored)) == sizeof(stored) &&
+                                stored.magic == VictronEnergyMagic &&
+                                strcmp(stored.mac, mVictronMac) == 0)
+                            {
+                                mVictronEnergy = stored;
+                            }
+                            else
+                            {
+                                Log::warn("Victron: stored energy counter is invalid or belongs to another device");
+                            }
+                        }
+                        else if (storedSize != 0)
+                        {
+                            Log::warn("Victron: stored energy counter has an unexpected size");
+                        }
+                    }
+                    Log::info("Victron: BLE monitoring enabled for %s", mVictronMac);
+                }
+            }
+        }
 
         mClient.setClient(*mWifi);
         mClient.setServer(settings.mqttHost, settings.mqttPort);
@@ -71,6 +177,12 @@ namespace DeyeBridge
 
     void MqttClient::ProcessEvents()
     {
+        if (mVictronConfigured)
+        {
+            mVictron.loop();
+            UpdateVictronEnergy();
+        }
+
         if (mSettings->mqttHost[0] == '\0')
         {
             return;
@@ -264,6 +376,8 @@ namespace DeyeBridge
             SendIfConnected(topic, payload, true);
         }
 
+        AdvertiseVictronDiscovery();
+
         Log::info("MQTT: Home Assistant discovery published (%u sensors, %u binaries, %u controls)",
                   static_cast<unsigned>(DeyeRegisters::kSensorCount + 2 + DeyeRegisters::kTimeSlotCount),
                   static_cast<unsigned>(DeyeRegisters::kBinaryCount),
@@ -403,6 +517,223 @@ namespace DeyeBridge
 
         snprintf(topic, sizeof(topic), "%sstate", mBase);
         SendIfConnected(topic, json, false);
+
+        PublishVictronValues();
+    }
+
+    void MqttClient::VictronDataCallback(const VictronDevice *device)
+    {
+        if (sVictronCallbackClient)
+        {
+            sVictronCallbackClient->HandleVictronData(device);
+        }
+    }
+
+    void MqttClient::HandleVictronData(const VictronDevice *device)
+    {
+        if (device->deviceType != DEVICE_TYPE_SOLAR_CHARGER || !device->dataValid)
+        {
+            return;
+        }
+
+        portENTER_CRITICAL(&mVictronMux);
+        mVictronSample.batteryVoltage = device->solar.batteryVoltage;
+        mVictronSample.batteryCurrent = device->solar.batteryCurrent;
+        mVictronSample.panelPower = device->solar.panelPower;
+        mVictronSample.yieldToday = device->solar.yieldToday;
+        mVictronSample.chargeState = device->solar.chargeState;
+        mVictronSample.rssi = device->rssi;
+        mVictronSample.lastUpdate = device->lastUpdate;
+        mVictronSample.valid = true;
+        portEXIT_CRITICAL(&mVictronMux);
+    }
+
+    void MqttClient::UpdateVictronEnergy()
+    {
+        VictronSample sample;
+        portENTER_CRITICAL(&mVictronMux);
+        sample = mVictronSample;
+        portEXIT_CRITICAL(&mVictronMux);
+
+        if (!sample.valid)
+        {
+            return;
+        }
+        if (sample.lastUpdate == mLastProcessedVictronUpdate)
+        {
+            SaveVictronEnergy(false);
+            return;
+        }
+        mLastProcessedVictronUpdate = sample.lastUpdate;
+
+        if (!mVictronEnergy.hasBaseline)
+        {
+            mVictronEnergy.totalYieldWh = sample.yieldToday;
+            mVictronEnergy.lastYieldToday = sample.yieldToday;
+            mVictronEnergy.hasBaseline = 1;
+            mVictronEnergyDirty = true;
+            SaveVictronEnergy(true);
+            return;
+        }
+
+        if (sample.yieldToday < mVictronEnergy.lastYieldToday)
+        {
+            mVictronEnergy.totalYieldWh += sample.yieldToday;
+            mVictronEnergy.lastYieldToday = sample.yieldToday;
+            mVictronEnergyDirty = true;
+            SaveVictronEnergy(true);
+            return;
+        }
+
+        const uint16_t delta = sample.yieldToday - mVictronEnergy.lastYieldToday;
+        if (delta != 0)
+        {
+            mVictronEnergy.totalYieldWh += delta;
+            mVictronEnergy.lastYieldToday = sample.yieldToday;
+            mVictronEnergyDirty = true;
+            SaveVictronEnergy(false);
+        }
+    }
+
+    void MqttClient::SaveVictronEnergy(bool force)
+    {
+        if (!mVictronPreferencesReady || !mVictronEnergyDirty)
+        {
+            return;
+        }
+
+        const uint32_t now = millis();
+        if (!force && now - mLastVictronEnergySaveMs < VictronEnergySaveIntervalMs)
+        {
+            return;
+        }
+
+        mVictronEnergy.magic = VictronEnergyMagic;
+        snprintf(mVictronEnergy.mac, sizeof(mVictronEnergy.mac), "%s", mVictronMac);
+        if (mVictronPreferences.putBytes("energy", &mVictronEnergy, sizeof(mVictronEnergy)) !=
+            sizeof(mVictronEnergy))
+        {
+            Log::error("Victron: failed to persist total energy counter");
+        }
+        else
+        {
+            mVictronEnergyDirty = false;
+        }
+        mLastVictronEnergySaveMs = now;
+    }
+
+    void MqttClient::AdvertiseVictronDiscovery()
+    {
+        if (!mVictronConfigured)
+        {
+            return;
+        }
+
+        struct Entity
+        {
+            const char *key;
+            const char *name;
+            const char *unit;
+            const char *deviceClass;
+            const char *stateClass;
+            const char *valueTemplate;
+            const char *entityCategory;
+        };
+        static const Entity entities[] = {
+            {"battery_voltage", "Battery Voltage", "V", "voltage", "measurement", "{{ value_json.batteryVoltage }}", nullptr},
+            {"battery_current", "Battery Current", "A", "current", "measurement", "{{ value_json.batteryCurrent }}", nullptr},
+            {"panel_power", "Panel Power", "W", "power", "measurement", "{{ value_json.panelPower }}", nullptr},
+            {"yield_today", "Yield Today", "Wh", "energy", "total", "{{ value_json.yieldToday }}", nullptr},
+            {"yield_total", "Total Yield", "kWh", "energy", "total_increasing", "{{ value_json.yieldTotalKwh }}", nullptr},
+            {"charge_state", "Charge State", nullptr, nullptr, nullptr, "{{ value_json.chargeState }}", "diagnostic"},
+        };
+
+        char stateTopic[80];
+        snprintf(stateTopic, sizeof(stateTopic), "%svictron/%s", mBase, mVictronMac);
+        char topic[120];
+        char payload[700];
+
+        for (size_t i = 0; i < sizeof(entities) / sizeof(entities[0]); ++i)
+        {
+            const Entity &e = entities[i];
+            char uniqueId[72];
+            snprintf(uniqueId, sizeof(uniqueId), "deye-bridge-victron_%s_%s", mVictronMac, e.key);
+
+            int n = snprintf(payload, sizeof(payload),
+                "{\"def_ent_id\":\"sensor.victron_%s_%s\","
+                "\"name\":\"Victron %s\",\"unique_id\":\"%s\","
+                "\"state_topic\":\"%s\",\"availability_topic\":\"%sstatus\","
+                "\"value_template\":\"%s\",",
+                mVictronMac, e.key, e.name, uniqueId, stateTopic, mBase, e.valueTemplate);
+            if (e.unit)
+            {
+                n += snprintf(payload + n, sizeof(payload) - n,
+                              "\"unit_of_measurement\":\"%s\",", e.unit);
+            }
+            if (e.deviceClass)
+            {
+                n += snprintf(payload + n, sizeof(payload) - n,
+                              "\"device_class\":\"%s\",", e.deviceClass);
+            }
+            if (e.stateClass)
+            {
+                n += snprintf(payload + n, sizeof(payload) - n,
+                              "\"state_class\":\"%s\",", e.stateClass);
+            }
+            if (e.entityCategory)
+            {
+                n += snprintf(payload + n, sizeof(payload) - n,
+                              "\"entity_category\":\"%s\",", e.entityCategory);
+            }
+            snprintf(payload + n, sizeof(payload) - n,
+                "\"device\":{\"identifiers\":[\"deye-bridge-victron-%s\"],"
+                "\"name\":\"Victron Solar Charger\",\"manufacturer\":\"Victron Energy\","
+                "\"model\":\"Solar Charger (BLE)\",\"sw_version\":\"" FIRMWARE_VERSION "\"}}",
+                mVictronMac);
+
+            snprintf(topic, sizeof(topic),
+                     "homeassistant/sensor/deye-bridge-victron/%s_%s/config",
+                     mVictronMac, e.key);
+            SendIfConnected(topic, payload, true);
+        }
+    }
+
+    void MqttClient::PublishVictronValues()
+    {
+        if (!mVictronConfigured)
+        {
+            return;
+        }
+
+        VictronSample sample;
+        portENTER_CRITICAL(&mVictronMux);
+        sample = mVictronSample;
+        portEXIT_CRITICAL(&mVictronMux);
+        if (!sample.valid)
+        {
+            return;
+        }
+
+        static const char *ChargeStates[] = {
+            "Off", "Low Power", "Fault", "Bulk", "Absorption", "Float",
+            "Storage", "Equalize", "Unknown", "Inverting", "Unknown",
+            "Power Supply",
+        };
+        const char *chargeState = sample.chargeState < sizeof(ChargeStates) / sizeof(ChargeStates[0])
+            ? ChargeStates[sample.chargeState]
+            : (sample.chargeState == CHARGER_EXTERNAL_CONTROL ? "External Control" : "Unknown");
+
+        char topic[80];
+        char payload[288];
+        snprintf(topic, sizeof(topic), "%svictron/%s", mBase, mVictronMac);
+        snprintf(payload, sizeof(payload),
+            "{\"name\":\"Victron Solar Charger\",\"mac\":\"%s\",\"rssi\":%d,"
+            "\"batteryVoltage\":%.2f,\"batteryCurrent\":%.2f,\"panelPower\":%.0f,"
+            "\"chargeState\":\"%s\",\"yieldToday\":%u,\"yieldTotalKwh\":%.3f}",
+            mVictronMac, sample.rssi, sample.batteryVoltage, sample.batteryCurrent,
+            sample.panelPower, chargeState, static_cast<unsigned>(sample.yieldToday),
+            static_cast<double>(mVictronEnergy.totalYieldWh) / 1000.0);
+        SendIfConnected(topic, payload, true);
     }
 
     void MqttClient::HandleCommand(char *topic, byte *payload, unsigned int length)

@@ -29,7 +29,7 @@ namespace DeyeBridge
 
     void SendFull(WiFiClient &client, const char *contentType, const char *body)
     {
-        client.printf("HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+        client.printf("HTTP/1.1 200 OK\r\nContent-Type: %s\r\nCache-Control: no-store\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
                       contentType, static_cast<unsigned>(strlen(body)));
         client.print(body);
     }
@@ -277,12 +277,16 @@ namespace DeyeBridge
 
     void WebConfig::ServeDiag(WiFiClient &client)
     {
-        char json[320];
+        char json[384];
         snprintf(json, sizeof(json),
-                 "{\"mqtt_connected\":%s,\"rtu_sweeps\":%u,\"rtu_errors\":%u,"
+                 "{\"firmware_version\":\"" FIRMWARE_VERSION "\","
+                 "\"mqtt_connected\":%s,\"victron_configured\":%s,"
+                 "\"victron_data_received\":%s,\"rtu_sweeps\":%u,\"rtu_errors\":%u,"
                  "\"rtu_timeouts\":%u,\"rtu_crc\":%u,\"rtu_exceptions\":%u,"
                  "\"valid_registers\":%u,\"rssi\":%d,\"uptime_ms\":%lu}",
                  (mMqtt && mMqtt->Connected()) ? "true" : "false",
+                 (mMqtt && mMqtt->VictronConfigured()) ? "true" : "false",
+                 (mMqtt && mMqtt->VictronDataReceived()) ? "true" : "false",
                  mPoller ? static_cast<unsigned>(mPoller->SweepCount()) : 0,
                  mPoller ? static_cast<unsigned>(mPoller->ErrorCount()) : 0,
                  mRtu ? static_cast<unsigned>(mRtu->TimeoutCount()) : 0,
@@ -313,6 +317,8 @@ namespace DeyeBridge
         char pass2Esc[sizeof(s.mqttPassword) * 6];
         char clientEsc[sizeof(s.mqttClientId) * 6];
         char baseEsc[sizeof(s.mqttBaseTopic) * 6];
+        char victronMacEsc[sizeof(s.victronMac) * 6];
+        char victronKeyEsc[sizeof(s.victronKey) * 6];
         Util::HtmlEscape(s.wifiSsid, ssidEsc, sizeof(ssidEsc));
         Util::HtmlEscape(s.wifiPassword, passEsc, sizeof(passEsc));
         Util::HtmlEscape(s.mqttHost, hostEsc, sizeof(hostEsc));
@@ -320,6 +326,8 @@ namespace DeyeBridge
         Util::HtmlEscape(s.mqttPassword, pass2Esc, sizeof(pass2Esc));
         Util::HtmlEscape(s.mqttClientId, clientEsc, sizeof(clientEsc));
         Util::HtmlEscape(s.mqttBaseTopic, baseEsc, sizeof(baseEsc));
+        Util::HtmlEscape(s.victronMac, victronMacEsc, sizeof(victronMacEsc));
+        Util::HtmlEscape(s.victronKey, victronKeyEsc, sizeof(victronKeyEsc));
 
         static char page[16384];
         int n = snprintf(page, sizeof(page),
@@ -425,6 +433,14 @@ namespace DeyeBridge
             "<div class='field'><label>Base Topic</label>"
             "<input type='text' name='mqtt_base' value='%s'></div></div>"
 
+            "<h2>Victron BLE Solar Charger</h2>"
+            "<div class='row2'><div class='field'><label>MAC Address</label>"
+            "<input type='text' name='victron_mac' value='%s' placeholder='AA:BB:CC:DD:EE:FF'></div>"
+            "<div class='field'><label>Encryption Key</label>"
+            "<input type='password' name='victron_key' value='%s' maxlength='32'></div></div>"
+            "<p class='hint'>Optional. Enter the charger MAC and its 32-digit BLE key. "
+            "MQTT state is published to &lt;base&gt;/victron/&lt;mac&gt;.</p>"
+
             "<h2><svg width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='4' y='4' width='16' height='16' rx='2'/><rect x='9' y='9' width='6' height='6'/><line x1='9' y1='1' x2='9' y2='4'/><line x1='15' y1='1' x2='15' y2='4'/><line x1='9' y1='20' x2='9' y2='23'/><line x1='15' y1='20' x2='15' y2='23'/><line x1='20' y1='9' x2='23' y2='9'/><line x1='20' y1='15' x2='23' y2='15'/><line x1='1' y1='9' x2='4' y2='9'/><line x1='1' y1='15' x2='4' y2='15'/></svg>"
             "Deye RTU</h2>"
             "<div class='row2'><div class='field'><label>Slave ID</label>"
@@ -468,7 +484,15 @@ namespace DeyeBridge
             "var x=new XMLHttpRequest();x.open('POST','/update');"
             "x.timeout=300000;"
             "x.onload=function(){s.textContent=x.responseText;};"
-            "x.onerror=function(){s.textContent='Upload fehlgeschlagen (Verbindung verloren)';};"
+            "x.onerror=function(){s.textContent='Verbindung unterbrochen; pruefe Neustart...';"
+            "var tries=0;var timer=setInterval(function(){tries++;"
+            "fetch('/diag?ota_check='+Date.now()).then(function(r){return r.json();})"
+            ".then(function(d){if(d.firmware_version==='" FIRMWARE_VERSION "'){"
+            "clearInterval(timer);s.textContent='Update erfolgreich: v'+d.firmware_version;"
+            "}else if(tries>=30){clearInterval(timer);"
+            "s.textContent='Bridge erreichbar, aber Version " FIRMWARE_VERSION " nicht bestaetigt.';}})"
+            ".catch(function(){if(tries>=30){clearInterval(timer);"
+            "s.textContent='Bridge nach Upload nicht erreichbar; Ergebnis unklar.';}});},1000);};"
             "x.send(f);}"
             "function wifiScan(){"
             "var s=document.getElementById('scanstatus');s.textContent='Scan laeuft...';"
@@ -501,7 +525,7 @@ namespace DeyeBridge
             "refreshLive();setInterval(refreshLive,5000);"
             "</script></body></html>",
             ssidEsc, passEsc, hostEsc, s.mqttPort, userEsc,
-            pass2Esc, clientEsc, baseEsc,
+            pass2Esc, clientEsc, baseEsc, victronMacEsc, victronKeyEsc,
             s.slaveId, static_cast<unsigned long>(s.rtuBaud),
             s.rtuTxPin, s.rtuRxPin, dePinText,
             static_cast<unsigned long>(s.pollIntervalMs),
@@ -510,33 +534,13 @@ namespace DeyeBridge
         SendResponse(client, "text/html", page);
     }
 
-    // Minimal URL decoding: %XX and '+' to space
-    static void UrlDecode(char *text)
-    {
-        char *out = text;
-        for (char *p = text; *p; ++p)
-        {
-            if (*p == '+')
-            {
-                *out++ = ' ';
-            }
-            else if (*p == '%' && p[1] && p[2])
-            {
-                char hex[3] = {p[1], p[2], '\0'};
-                *out++ = static_cast<char>(strtol(hex, nullptr, 16));
-                p += 2;
-            }
-            else
-            {
-                *out++ = *p;
-            }
-        }
-        *out = '\0';
-    }
-
     static void CopyFormField(const char *body, const char *field, char *out, size_t size,
                               bool clearIfAbsent = true)
     {
+        if (size == 0)
+        {
+            return;
+        }
         // Absent field: leave the current value untouched unless the caller
         // explicitly wants a clear (numeric buffers rely on the clear to skip)
         if (clearIfAbsent)
@@ -554,10 +558,23 @@ namespace DeyeBridge
                 p += fieldLength + 1;
                 const char *end = strchr(p, '&');
                 const size_t length = end ? static_cast<size_t>(end - p) : strlen(p);
-                const size_t copy = length < size - 1 ? length : size - 1;
-                memcpy(out, p, copy);
-                out[copy] = '\0';
-                UrlDecode(out);
+                size_t written = 0;
+                for (size_t read = 0; read < length && written < size - 1; ++read)
+                {
+                    char value = p[read];
+                    if (value == '+')
+                    {
+                        value = ' ';
+                    }
+                    else if (value == '%' && read + 2 < length)
+                    {
+                        char hex[3] = {p[read + 1], p[read + 2], '\0'};
+                        value = static_cast<char>(strtol(hex, nullptr, 16));
+                        read += 2;
+                    }
+                    out[written++] = value;
+                }
+                out[written] = '\0';
                 return;
             }
             ++p;
@@ -581,6 +598,8 @@ namespace DeyeBridge
         CopyFormField(body, "mqtt_pass", s.mqttPassword, sizeof(s.mqttPassword), false);
         CopyFormField(body, "mqtt_client", s.mqttClientId, sizeof(s.mqttClientId), false);
         CopyFormField(body, "mqtt_base", s.mqttBaseTopic, sizeof(s.mqttBaseTopic), false);
+        CopyFormField(body, "victron_mac", s.victronMac, sizeof(s.victronMac), false);
+        CopyFormField(body, "victron_key", s.victronKey, sizeof(s.victronKey), false);
 
         char buffer[16];
         CopyFormField(body, "mqtt_port", buffer, sizeof(buffer));

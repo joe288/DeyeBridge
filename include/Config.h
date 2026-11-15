@@ -1,8 +1,8 @@
 #pragma once
 
-// Firmware version, baked into MQTT discovery (sw_version) and the web footer.
+// Firmware version, baked into MQTT discovery, /diag and the web footer.
 // Bump on every release; tools/deploy.sh reads it from here.
-#define FIRMWARE_VERSION "1.4.3"
+#define FIRMWARE_VERSION "1.4.6"
 
 namespace Config
 {
